@@ -31,7 +31,7 @@ class EvaluadorDocumental:
         if not api_key:
             raise ValueError("No se encontró GROQ_API_KEY en secrets.")
         self.client = Groq(api_key=api_key)
-        self.modelo = "llama-3.3-70b-versatile"
+        self.modelo = "qwen/qwen3.8-27b"
 
     def auditar_documento(self, contexto_estricto, contexto_referencial, paginas_alumno):
         texto_alumno_completo = "\n".join([f"[Pág. {p['pagina']}]: {p['contenido']}" for p in paginas_alumno])

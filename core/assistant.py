@@ -1,6 +1,4 @@
 import os
-import base64
-import tempfile
 import time
 import streamlit as st
 from groq import Groq, RateLimitError
@@ -16,71 +14,91 @@ class AsistenteDocumental:
         # 2. Inicializar cliente
         self.client = Groq(api_key=api_key)
         
-        # 3. Inicializar modelos
-        self.modelo_texto = self._obtener_modelo_texto()
-        self.modelo_vision = self._obtener_modelo_vision()
+        # Modelo oficial confirmado y ultra-rápido en tu cuenta
+        self.modelo = "qwen/qwen3.8-27b"
 
-    def _obtener_modelo_texto(self):
-        try:
-            modelos_remotos = [m.id for m in self.client.models.list().data]
-            prioridades = ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama-3.1-8b-instant"]
-            for p in prioridades:
-                if p in modelos_remotos: return p
-            return "llama-3.3-70b-versatile"
-        except Exception:
-            return "llama-3.3-70b-versatile"
-
-    def _obtener_modelo_vision(self):
-        try:
-            modelos_remotos = [m.id for m in self.client.models.list().data]
-            prioridades_vision = ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]
-            for p in prioridades_vision:
-                if p in modelos_remotos: return p
-            return "llama-3.2-11b-vision-preview"
-        except Exception:
-            return "llama-3.2-11b-vision-preview"
-
-    def _extraer_frame_video(self, video_bytes):
-        try:
-            import cv2
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-                tmp.write(video_bytes)
-                tmp_path = tmp.name
-            vid = cv2.VideoCapture(tmp_path)
-            success, frame = vid.read()
-            vid.release()
-            os.remove(tmp_path)
-            if success:
-                _, buffer = cv2.imencode(".jpg", frame)
-                return buffer.tobytes(), "image/jpeg"
-        except Exception:
-            pass
-        return None, None
+    def _call_api_with_retry(self, **kwargs):
+        """Sistema de reintento automático (Backoff) si Groq satura por Rate Limit (429)"""
+        max_retries = 3
+        for i in range(max_retries):
+            try:
+                return self.client.chat.completions.create(**kwargs)
+            except RateLimitError:
+                if i < max_retries - 1:
+                    time.sleep(2 ** i) # Espera 1s, 2s, 4s y reintenta
+                    continue
+                else:
+                    raise
+        return None
 
     def explicar_estructura_y_partes(self, texto_doc):
-        prompt = f"Eres un tutor experto. Analiza este texto y genera una guía de estructura:\n{texto_doc[:5000]}"
-        response = self.client.chat.completions.create(
-            model=self.modelo_texto,
-            messages=[{"role": "user", "content": prompt}],
+        prompt = f"""
+        Eres un docente y tutor técnico experto en ingeniería y proyectos mineros.
+        Analiza las bases suministradas y genera una GUÍA DE SU ESTRUCTURA:
+        1. Objetivo y alcance principal.
+        2. Desglose de capítulos y requisitos obligatorios.
+        3. Errores críticos que no se deben cometer.
+
+        CONTENIDO:
+        {texto_doc[:12000]}
+        """
+        response = self._call_api_with_retry(
+            model=self.modelo,
+            messages=[
+                {"role": "system", "content": "Eres un tutor académico claro, exigente y didáctico."},
+                {"role": "user", "content": prompt}
+            ],
             temperature=0.2,
-            max_tokens=500
+            max_tokens=800
         )
         return response.choices[0].message.content
 
     def responder_pregunta(self, pregunta, contexto_estricto, contexto_referencial, contexto_alumno, historial, archivo_multimedia=None):
-        # Truncado para evitar errores de tamaño
-        msg_system = "Eres un tutor de ingeniería experto. Sé conciso. Prioriza siempre la NORMATIVA OBLIGATORIA."
-        mensajes = [{"role": "system", "content": msg_system}]
-        mensajes.append({"role": "user", "content": f"NORMATIVA: {contexto_estricto[:8000]}\nREF: {contexto_referencial[:3000]}\nTRABAJO: {contexto_alumno[:5000]}\n\nPREGUNTA: {pregunta}"})
-        
-        modelo = self.modelo_texto
-        # Lógica de multimedia simplificada
-        if archivo_multimedia and archivo_multimedia.get("tipo", "").startswith("image"):
-            modelo = self.modelo_vision
-            # ... lógica b64 ...
-            
-        response = self.client.chat.completions.create(
-            model=modelo,
+        # Truncados inteligentes para proteger los tokens de entrada
+        info_estricta = contexto_estricto[:10000]
+        info_referencial = contexto_referencial[:5000]
+        doc_info = f"\n--- BORRADOR DEL ALUMNO ---\n{contexto_alumno[:8000]}" if contexto_alumno else "\n[El alumno aún no ha subido su borrador]"
+
+        mensajes = [
+            {
+                "role": "system",
+                "content": (
+                    "Eres un Profesor Tutor y Asesor Técnico experto en ingeniería y proyectos mineros.\n\n"
+                    "DISPONES DE DOS FUENTES DE INFORMACIÓN CON DISTINTA JERARQUÍA:\n"
+                    "1. NORMATIVA OBLIGATORIA (VERDAD ABSOLUTA): Bases, rúbricas, fórmulas y límites legales oficiales. "
+                    "Es inquebrantable. Si el alumno incumple algo de aquí, adviértele con firmeza técnica.\n"
+                    "2. MATERIAL DE APOYO (REFERENCIAL): Manuales y guías metodológicas.\n\n"
+                    "REGLA DE CONFLICTO: Si un documento referencial contradice a la Normativa Obligatoria, "
+                    "manda 100% la Normativa Obligatoria sin excepción.\n"
+                    "Sé conciso, directo, técnico y responde en máximo 3 párrafos o viñetas."
+                )
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"=== [NORMATIVA OBLIGATORIA] ===\n{info_estricta}\n\n"
+                    f"=== [MATERIAL DE APOYO] ===\n{info_referencial}\n\n"
+                    f"{doc_info}"
+                )
+            }
+        ]
+
+        # Sanitizar historial (últimas 2 interacciones para ahorrar tokens)
+        for msg in historial[-4:]:
+            txt = msg.get("content", "")
+            if isinstance(txt, str) and txt.strip():
+                mensajes.append({"role": msg["role"], "content": txt})
+
+        # Manejo de multimedia adaptado al modelo de texto
+        if archivo_multimedia and archivo_multimedia.get("bytes"):
+            nombre = archivo_multimedia.get("nombre", "archivo")
+            pregunta = f"{pregunta} [Nota del sistema: El usuario adjuntó el archivo multimedia '{nombre}']."
+
+        mensajes.append({"role": "user", "content": pregunta})
+
+        # Llamada protegida contra Rate Limits
+        response = self._call_api_with_retry(
+            model=self.modelo,
             messages=mensajes,
             temperature=0.2,
             max_tokens=800

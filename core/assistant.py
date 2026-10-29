@@ -8,67 +8,81 @@ from core.benchmark import CRITERIOS_REFERENCIA
 
 class AsistenteDocumental:
     def __init__(self):
+        # 1. Asegurar que la API KEY esté presente
         api_key = st.secrets.get("GROQ_API_KEY")
         if not api_key:
             raise ValueError("No se encontró GROQ_API_KEY en secrets.")
+            
+        # 2. Inicializar cliente
         self.client = Groq(api_key=api_key)
+        
+        # 3. Inicializar modelos
         self.modelo_texto = self._obtener_modelo_texto()
         self.modelo_vision = self._obtener_modelo_vision()
 
-    # ... (Mantén tus métodos _obtener_modelo_texto y _obtener_modelo_vision iguales) ...
+    def _obtener_modelo_texto(self):
+        try:
+            modelos_remotos = [m.id for m in self.client.models.list().data]
+            prioridades = ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama-3.1-8b-instant"]
+            for p in prioridades:
+                if p in modelos_remotos: return p
+            return "llama-3.3-70b-versatile"
+        except Exception:
+            return "llama-3.3-70b-versatile"
 
-    def _call_api_with_retry(self, **kwargs):
-        """Intenta llamar a la API y si hay RateLimit, espera y reintenta."""
-        max_retries = 3
-        for i in range(max_retries):
-            try:
-                return self.client.chat.completions.create(**kwargs)
-            except RateLimitError:
-                if i < max_retries - 1:
-                    wait = 2 ** i # Espera exponencial: 1s, 2s, 4s...
-                    time.sleep(wait)
-                    continue
-                else:
-                    raise
-        return None
+    def _obtener_modelo_vision(self):
+        try:
+            modelos_remotos = [m.id for m in self.client.models.list().data]
+            prioridades_vision = ["llama-3.2-11b-vision-preview", "llama-3.2-90b-vision-preview"]
+            for p in prioridades_vision:
+                if p in modelos_remotos: return p
+            return "llama-3.2-11b-vision-preview"
+        except Exception:
+            return "llama-3.2-11b-vision-preview"
+
+    def _extraer_frame_video(self, video_bytes):
+        try:
+            import cv2
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+                tmp.write(video_bytes)
+                tmp_path = tmp.name
+            vid = cv2.VideoCapture(tmp_path)
+            success, frame = vid.read()
+            vid.release()
+            os.remove(tmp_path)
+            if success:
+                _, buffer = cv2.imencode(".jpg", frame)
+                return buffer.tobytes(), "image/jpeg"
+        except Exception:
+            pass
+        return None, None
+
+    def explicar_estructura_y_partes(self, texto_doc):
+        prompt = f"Eres un tutor experto. Analiza este texto y genera una guía de estructura:\n{texto_doc[:5000]}"
+        response = self.client.chat.completions.create(
+            model=self.modelo_texto,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=500
+        )
+        return response.choices[0].message.content
 
     def responder_pregunta(self, pregunta, contexto_estricto, contexto_referencial, contexto_alumno, historial, archivo_multimedia=None):
-        # 1. Truncamos para no superar la ventana de contexto del modelo
-        info_estricta = contexto_estricto[:12000]
-        info_referencial = contexto_referencial[:8000]
-        doc_info = contexto_alumno[:10000]
-
-        mensajes = [
-            {
-                "role": "system",
-                "content": (
-                    "Eres un Profesor Tutor experto en minería. "
-                    "Tu misión es dar feedback preciso y técnico. "
-                    "REGLA: Si hay contradicción entre 'NORMATIVA OBLIGATORIA' y 'REFERENCIAL', manda la NORMATIVA. "
-                    "Sé directo, usa bullet points y no excedas los 500 tokens de respuesta."
-                )
-            },
-            {
-                "role": "user",
-                "content": f"NORMATIVA: {info_estricta}\n\nREFERENCIAS: {info_referencial}\n\nTRABAJO: {doc_info}\n\nPREGUNTA: {pregunta}"
-            }
-        ]
+        # Truncado para evitar errores de tamaño
+        msg_system = "Eres un tutor de ingeniería experto. Sé conciso. Prioriza siempre la NORMATIVA OBLIGATORIA."
+        mensajes = [{"role": "system", "content": msg_system}]
+        mensajes.append({"role": "user", "content": f"NORMATIVA: {contexto_estricto[:8000]}\nREF: {contexto_referencial[:3000]}\nTRABAJO: {contexto_alumno[:5000]}\n\nPREGUNTA: {pregunta}"})
         
-        # Sanitizar historial
-        for msg in historial[-4:]:
-            txt = msg.get("content", "")
-            if isinstance(txt, str) and txt.strip():
-                mensajes.append({"role": msg["role"], "content": txt})
-
-        # Preparar mensaje
-        modelo_elegido = self.modelo_texto
-        # ... (Mantén tu lógica de adjuntos igual, solo cambia la llamada final a la API)
-
-        # 2. LLAMADA PROTEGIDA CON RETRY Y LÍMITE DE TOKENS
-        response = self._call_api_with_retry(
-            model=modelo_elegido,
+        modelo = self.modelo_texto
+        # Lógica de multimedia simplificada
+        if archivo_multimedia and archivo_multimedia.get("tipo", "").startswith("image"):
+            modelo = self.modelo_vision
+            # ... lógica b64 ...
+            
+        response = self.client.chat.completions.create(
+            model=modelo,
             messages=mensajes,
             temperature=0.2,
-            max_tokens=1000 # <-- LIMITADOR CLAVE PARA EL ERROR 429
+            max_tokens=800
         )
         return response.choices[0].message.content
